@@ -1,40 +1,22 @@
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    本地构建并以 GitHub API 发布 FastGithubOps.UI 的 win-x64 Release。
-
-.DESCRIPTION
-    这是 CI（release.yml）之外的一条独立发布路径。当 fork 仓库的 GITHUB_TOKEN
-    无写权限、无法在 CI 内推送 tag 时，用本机 dotnet 构建，再用已登录的 gh CLI
-    创建 Release 并上传产物。所有产物写到系统临时目录，不污染工作区。
-
-    流程：前置检查 -> 构建主程序(net10 单文件) + UI(net45) -> 关键文件校验
-          -> 删除 cacert/logs -> 生成 sha256 -> 扁平 zip -> gh release create
-          -> 上传后回读核对 size 与 sha256。
+    在 Windows 本地构建 win-x64 发布包，核对 GitHub 草稿资产后公开发布。
 
 .PARAMETER Version
-    版本号，格式 vX.Y.Z（例如 v2.6.15）。必须与 Directory.Build.props 的
-    <Version> 一致，且 release-notes/<Version>.md 已存在。
+    vX.Y.Z 格式的版本号，必须与 Directory.Build.props 和 release-notes/<版本>.md 一致。
 
 .PARAMETER Repo
-    目标仓库，默认当前 fork：FluxForceDynamics/FastGithubOps.UI。
+    GitHub.com 目标仓库（owner/repo），默认 FluxForceDynamics/FastGithubOps.UI。
 
 .PARAMETER Target
-    打 tag 所基于的提交。默认取当前 HEAD 的完整 40 位 SHA。
-    注意：gh release create 的 --target 必须用完整 SHA，短 SHA 会报
-    "target_commitish is invalid"。
+    正式发布使用的完整提交 SHA，必须等于当前 HEAD。默认取当前 HEAD。
 
 .PARAMETER OutDir
-    构建/打包输出目录。默认系统临时目录下的 fastgithub-release-<Version>。
+    本次构建和打包的输出目录，指定路径必须尚不存在。默认在系统临时目录下为本次运行创建新目录。
 
 .PARAMETER NoPublish
-    只做构建、校验与打包，不创建 Release。用于验证脚本或离线检查产物。
-
-.PARAMETER SkipChecks
-    跳过「版本号与 props 一致 / release notes 存在 / tag 未占用」前置检查。
-    一般不要使用，仅在特殊恢复场景。
-
-.EXAMPLE
-    .\release-local.ps1 -Version v2.6.15
+    只构建、校验和打包，不访问 GitHub 发布 API。允许构建工作区中的改动。
 
 .EXAMPLE
     .\release-local.ps1 -Version v2.6.15 -NoPublish
@@ -42,97 +24,124 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^v\d+\.\d+\.\d+$')]
+    [ValidatePattern('(?-i)\Av[0-9]+\.[0-9]+\.[0-9]+\z')]
     [string]$Version,
 
+    [ValidatePattern('\A[A-Za-z0-9-]+/[A-Za-z0-9_.-]+\z')]
     [string]$Repo = 'FluxForceDynamics/FastGithubOps.UI',
 
+    [ValidatePattern('\A[0-9a-fA-F]{40}\z')]
     [string]$Target,
 
     [string]$OutDir,
 
-    [switch]$NoPublish,
-
-    [switch]$SkipChecks
+    [switch]$NoPublish
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# 显式检查本机命令的退出码，使脚本不受调用方的 PowerShell 7 偏好设置影响。
+$PSNativeCommandUseErrorActionPreference = $false
 
-function Write-Step { param($msg) Write-Host "`n==> $msg" -ForegroundColor Cyan }
-function Write-Ok    { param($msg) Write-Host "    $msg" -ForegroundColor Green }
-function Write-Warn2 { param($msg) Write-Host "    [警告] $msg" -ForegroundColor Yellow }
-function Fail        { param($msg) throw "错误: $msg" }
+function Write-Step {
+    param([string]$Message)
 
-# 定位仓库根（脚本所在目录），所有相对路径都相对它。
-$RepoRoot = $PSScriptRoot
-$publishDir = Join-Path $RepoRoot 'publish'
-Push-Location $RepoRoot
+    Write-Host
+    Write-Host "==> $Message" -ForegroundColor Cyan
+}
 
+function Get-CleanHead {
+    $head = & git rev-parse --verify HEAD
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '\A[0-9a-f]{40}\z') {
+        throw '无法取得当前 Git 提交的完整 SHA'
+    }
+
+    $changes = & git status --porcelain --untracked-files=all
+    if ($LASTEXITCODE -ne 0) {
+        throw '无法检查 Git 工作区状态'
+    }
+    if ($changes) {
+        throw '正式发布需要干净的 Git 工作区。请提交改动或使用 -NoPublish 演练'
+    }
+    return $head
+}
+
+function Invoke-GitHubApi {
+    param([string[]]$ApiArguments)
+
+    $response = & gh api --hostname github.com @ApiArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "GitHub API 请求失败（$($ApiArguments[0])，gh 退出码 $LASTEXITCODE）"
+    }
+    return $response
+}
+
+if ($OutDir) {
+    $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
+} else {
+    $runId = [Guid]::NewGuid().ToString('N')
+    $OutDir = Join-Path ([System.IO.Path]::GetTempPath()) "fastgithub-release-$Version-$runId"
+}
+
+Push-Location -LiteralPath $PSScriptRoot
 try {
-    # ------------------------------------------------------------------ 前置检查
-    Write-Step '前置检查'
-
-    $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
-    if (-not $dotnetCmd) { Fail '未找到 dotnet，请先安装 .NET 10 SDK' }
-    Write-Ok ("dotnet: " + (& dotnet --version))
-
-    $ghCmd = Get-Command gh -ErrorAction SilentlyContinue
-    if (-not $ghCmd -and -not $NoPublish) { Fail '未找到 gh CLI，请先安装并登录' }
-    if ($ghCmd) {
-        & gh auth status 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0 -and -not $NoPublish) { Fail 'gh 未登录，请先执行 gh auth login' }
-        $gh = $ghCmd.Source
-        if ($NoPublish) { Write-Ok 'gh: 已找到（-NoPublish 模式不校验登录态）' }
+    Write-Step '检查构建和发布条件'
+    if (Test-Path -LiteralPath $OutDir) {
+        throw "输出路径已存在，请指定新目录：$OutDir"
+    }
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        throw '未找到 dotnet，请安装 .NET 10 SDK'
     }
 
-    if (-not (Test-Path (Join-Path $RepoRoot 'Directory.Build.props'))) {
-        Fail '脚本必须放在仓库根目录执行（找不到 Directory.Build.props）'
+    $propsPath = Join-Path $PSScriptRoot 'Directory.Build.props'
+    [xml]$props = Get-Content -LiteralPath $propsPath -Raw -Encoding UTF8
+    $versionNode = $props.SelectSingleNode('/Project/PropertyGroup/Version')
+    if ($null -eq $versionNode -or $versionNode.InnerText.Trim() -cne $Version.Substring(1)) {
+        throw "版本 $Version 与 Directory.Build.props 的 <Version> 不一致"
     }
 
-    if (-not $SkipChecks) {
-        # 版本号必须与程序集版本一致，否则会出现「Release 叫 v2.6.15、exe 内部还是 2.6.14」。
-        $propsRaw = Get-Content (Join-Path $RepoRoot 'Directory.Build.props') -Raw -Encoding UTF8
-        $assemblyVersion = $null
-        if ($propsRaw -match '<Version>\s*([0-9]+\.[0-9]+\.[0-9]+)\s*</Version>') {
-            $assemblyVersion = $Matches[1]
-        }
-        $bare = $Version.TrimStart('v')
-        if ($assemblyVersion -ne $bare) {
-            Fail "Version ($bare) 与 Directory.Build.props 的 <Version> ($assemblyVersion) 不一致；请先同步版本号"
-        }
-        Write-Ok "版本号一致: $bare"
+    $notesPath = Join-Path $PSScriptRoot "release-notes/$Version.md"
+    if (-not (Test-Path -LiteralPath $notesPath -PathType Leaf)) {
+        throw "缺少发布说明：release-notes/$Version.md"
+    }
 
-        # Release 正文必须是因为单一事实来源，缺失时宁可中断，也不发一个没有说明的包。
-        $notesPath = Join-Path $RepoRoot "release-notes/$Version.md"
-        if (-not (Test-Path $notesPath)) {
-            Fail "缺少 release-notes/$Version.md，请先编写发布说明"
+    $repoApi = "repos/$Repo"
+    $tagRef = "refs/tags/$Version"
+    if (-not $NoPublish) {
+        if (-not (Get-Command git -ErrorAction SilentlyContinue) -or -not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw '正式发布需要 Git 和已登录的 GitHub CLI'
         }
-        Write-Ok "发布说明存在: release-notes/$Version.md"
+        $head = Get-CleanHead
+        if ($Target -and $Target -ine $head) {
+            throw "Target 必须等于当前 HEAD；当前提交为 $head"
+        }
+        $Target = $head
 
-        if (-not $NoPublish) {
-            # 已存在的 tag / Release 不再重复发布，避免覆盖。
-            & $gh api "repos/$Repo/git/ref/tags/$Version" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { Fail "远程已存在 tag $Version" }
-            Write-Ok '远程无同名 tag'
+        if ((Invoke-GitHubApi @($repoApi, '--jq', '.permissions.push')) -ne 'true') {
+            throw "当前 GitHub 凭据缺少 $Repo 的写权限"
         }
-    } else {
-        $notesPath = Join-Path $RepoRoot "release-notes/$Version.md"
-        if (-not (Test-Path $notesPath)) {
-            Write-Warn2 "release-notes/$Version.md 不存在（-SkipChecks），将不传 --notes-file"
+        $remoteHead = Invoke-GitHubApi @("$repoApi/commits/$Target", '--jq', '.sha')
+        if ($remoteHead -ine $Target) {
+            throw "目标仓库中找不到提交 $Target，请先推送该提交"
+        }
+
+        # 匹配接口在没有同名引用时成功返回空列表，网络及权限错误仍会中断。
+        $tagRefs = Invoke-GitHubApi @("$repoApi/git/matching-refs/tags/$Version", '--jq', '.[].ref')
+        if ($tagRefs -ccontains $tagRef) {
+            throw "远程已存在标签 $Version"
+        }
+        $releaseTags = Invoke-GitHubApi @("$repoApi/releases", '--paginate', '--jq', '.[].tag_name')
+        if ($releaseTags -ccontains $Version) {
+            throw "远程已存在 $Version 的 Release 或草稿"
         }
     }
 
-    # ------------------------------------------------------------------ 输出目录
-    if (-not $OutDir) { $OutDir = Join-Path $env:TEMP ("fastgithub-release-" + $Version) }
-    $OutDir = [System.IO.Path]::GetFullPath($OutDir)
-    if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
-    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-    Write-Ok "输出目录: $OutDir"
+    # 不带 -Force，目录被其他进程抢先创建时同样中断。
+    New-Item -ItemType Directory -Path $OutDir | Out-Null
+    Write-Host "输出目录：$OutDir"
 
-    # 用临时 NuGet 配置指向 nuget.org：仓库自带的华为云镜像在部分网络下会返回损坏的 nupkg。
-    # 通过 -p:RestoreConfigFile 注入，不修改仓库的 NuGet.config。
-    $nugetCfg = Join-Path $OutDir 'NuGet.org.config'
+    # 临时使用 nuget.org，避免仓库配置的镜像返回损坏的 nupkg。
+    $nugetConfig = Join-Path $OutDir 'NuGet.org.config'
     @'
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
@@ -141,106 +150,130 @@ try {
     <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
   </packageSources>
 </configuration>
-'@ | Set-Content -Path $nugetCfg -Encoding UTF8
+'@ | Set-Content -LiteralPath $nugetConfig -Encoding UTF8
 
     $binDir = Join-Path $OutDir 'bin'
+    $publishArguments = @('-c', 'Release', '--artifacts-path', (Join-Path $OutDir 'artifacts'),
+        "-p:RestoreConfigFile=$nugetConfig", '-o', $binDir)
 
-    # ------------------------------------------------------------------ 构建
-    Write-Step '构建主程序（net10 / win-x64 自包含单文件）'
-    & dotnet publish FastGithub/FastGithub.csproj -c Release -r win-x64 `
-        --self-contained true -p:PublishSingleFile=true `
-        "-p:RestoreConfigFile=$nugetCfg" -o $binDir
-    if ($LASTEXITCODE -ne 0) { Fail '主程序构建失败' }
-
-    Write-Step '构建 UI（net45 / WPF，输出到同一目录）'
-    & dotnet publish FastGithub.UI/FastGithub.UI.csproj -c Release `
-        "-p:RestoreConfigFile=$nugetCfg" -o $binDir
-    if ($LASTEXITCODE -ne 0) { Fail 'UI 构建失败' }
-
-    # ------------------------------------------------------------------ 校验文件
-    Write-Step '校验发布文件'
-    foreach ($f in @('fastgithub.exe', 'FastGithub.UI.exe', 'FastGithub.UI.exe.config', 'appsettings.json')) {
-        if (-not (Test-Path (Join-Path $binDir $f))) { Fail "缺少发布文件: $f" }
-        Write-Ok "OK  $f"
+    Write-Step '构建主程序（net10.0 / win-x64 自包含单文件）'
+    & dotnet publish FastGithub/FastGithub.csproj @publishArguments -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=false
+    if ($LASTEXITCODE -ne 0) {
+        throw '主程序构建失败'
     }
 
-    # CA 私钥绝不能随包分发：程序启动会自动重建 cacert 目录。
-    foreach ($d in @('cacert', 'logs')) {
-        $p = Join-Path $binDir $d
-        if (Test-Path $p) { Remove-Item $p -Recurse -Force; Write-Ok "已删除敏感目录: $d" }
+    Write-Step '构建 UI（net45 / WPF）'
+    & dotnet publish FastGithub.UI/FastGithub.UI.csproj @publishArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw 'UI 构建失败'
     }
 
-    # ------------------------------------------------------------------ 打包
-    Write-Step '生成 sha256 与 zip'
+    Write-Step '校验并打包发布文件'
+    $executables = @('fastgithub.exe', 'FastGithub.UI.exe')
+    $requiredFiles = $executables + @('FastGithub.UI.exe.config', 'appsettings.json',
+        'dnscrypt-proxy/dnscrypt-proxy.exe', 'dnscrypt-proxy/dnscrypt-proxy.toml')
+    foreach ($fileName in $requiredFiles) {
+        $filePath = Join-Path $binDir $fileName
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf) -or (Get-Item -LiteralPath $filePath).Length -eq 0) {
+            throw "发布文件缺失或为空：$fileName"
+        }
+    }
+
     $shaFile = Join-Path $OutDir 'fastgithub-win-x64.sha256'
-    $shaLines = @()
-    foreach ($f in @('fastgithub.exe', 'FastGithub.UI.exe')) {
-        $h = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $binDir $f)).Hash.ToLower()
-        # 与 CI 的 sha256sum 输出格式一致：两个空格 + 文件名。
-        $shaLines += "$h  $f"
+    $shaLines = foreach ($fileName in $executables) {
+        $hash = (Get-FileHash -LiteralPath (Join-Path $binDir $fileName) -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $fileName"
     }
-    $shaLines | Set-Content -Path $shaFile -Encoding ASCII
-    Write-Ok ($shaLines -join "`n    ")
+    Set-Content -LiteralPath $shaFile -Value $shaLines -Encoding ASCII
 
+    # cacert 可能含本机 CA 私钥。打包时排除它和日志目录。
+    $archiveEntries = Get-ChildItem -LiteralPath $binDir | Where-Object { $_.Name -notin @('cacert', 'logs') }
     $zipFile = Join-Path $OutDir 'fastgithub-win-x64.zip'
-    if (Test-Path $zipFile) { Remove-Item $zipFile -Force }
-    Compress-Archive -Path (Join-Path $binDir '*') -DestinationPath $zipFile -CompressionLevel Optimal
-    Write-Ok ("zip: {0} ({1} 字节)" -f $zipFile, (Get-Item $zipFile).Length)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::Open($zipFile, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $archiveFiles = Get-ChildItem -LiteralPath $archiveEntries.FullName -Recurse -File
+        foreach ($file in $archiveFiles) {
+            # 显式使用 ZIP 路径分隔符，避免 Windows PowerShell 5.1 写入反斜杠。
+            $entryName = $file.FullName.Substring($binDir.Length + 1).Replace('\', '/')
+            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, $file.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally {
+        $archive.Dispose()
+    }
+    Write-Host "$zipFile"
+    Write-Host "$shaFile"
 
     if ($NoPublish) {
-        Write-Host "`n-NoPublish：已生成产物，未创建 Release。" -ForegroundColor Green
-        Write-Host "  $zipFile`n  $shaFile"
         return
     }
 
-    # ------------------------------------------------------------------ 发布
-    Write-Step '创建 GitHub Release 并上传'
-    if (-not $Target) { $Target = (& git rev-parse HEAD).Trim() }
-    if ($Target -notmatch '^[0-9a-f]{40}$') {
-        Fail "Target 必须是完整 40 位 SHA（当前: $Target），短 SHA 会报 target_commitish is invalid"
+    if ((Get-CleanHead) -cne $Target) {
+        throw '构建期间 HEAD 已变更，请重新构建'
     }
-    Write-Ok "target: $Target"
 
-    $assetArgs = @($zipFile, $shaFile)
-    $releaseArgs = @('release', 'create', $Version,
-        '--repo', $Repo,
-        '--title', "FastGithubOps.UI $Version",
-        '--target', $Target)
-    if (Test-Path $notesPath) { $releaseArgs += @('--notes-file', $notesPath) }
-    $releaseArgs += $assetArgs
-
-    & $gh @releaseArgs
-    if ($LASTEXITCODE -ne 0) { Fail 'gh release create 失败' }
-
-    # ------------------------------------------------------------------ 回读核对
-    # 上传后回读 size 与 digest（sha256）核对，防止链路损坏导致发出坏包。
-    # 这一条继承自仓库内 create_release.py 的既有约定。
-    Write-Step '回读核对上传产物'
-    $json = & $gh api "repos/$Repo/releases/tags/$Version" `
-        --jq '[.assets[] | {name, size, digest}]' | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { Fail '回读 Release assets 失败' }
-
-    $allOk = $true
-    foreach ($asset in $json) {
-        $local = if ($asset.name -eq 'fastgithub-win-x64.zip') { $zipFile } else { $shaFile }
-        if (-not (Test-Path $local)) { continue }
-        $localSize = (Get-Item $local).Length
-        $localHash = (Get-FileHash -Algorithm SHA256 -Path $local).Hash.ToLower()
-        $remoteHash = ($asset.digest -replace '^sha256:', '').ToLower()
-        $sizeOk = ($asset.size -eq $localSize)
-        $hashOk = ($remoteHash -eq $localHash)
-        if ($sizeOk -and $hashOk) {
-            Write-Ok ("核对一致: {0}  sha256={1}..." -f $asset.name, $localHash.Substring(0, 16))
-        } else {
-            $allOk = $false
-            Write-Warn2 ("不一致: {0}  size {1}/{2}  sha256 {3}/{4}" -f `
-                $asset.name, $asset.size, $localSize, $remoteHash, $localHash)
+    $localAssets = foreach ($assetPath in @($zipFile, $shaFile)) {
+        $assetFile = Get-Item -LiteralPath $assetPath
+        $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        [PSCustomObject]@{
+            Name = $assetFile.Name
+            Path = $assetFile.FullName
+            Size = $assetFile.Length
+            Digest = "sha256:$hash"
         }
     }
-    if (-not $allOk) { Fail '上传产物回读核对失败，请检查 Release' }
 
-    Write-Host "`n发布完成: https://github.com/$Repo/releases/tag/$Version" -ForegroundColor Green
-}
-finally {
+    Write-Step '创建 Release 草稿'
+    $draftId = Invoke-GitHubApi @("$repoApi/releases", '--method', 'POST',
+        '-f', "tag_name=$Version", '-f', "target_commitish=$Target",
+        '-f', "name=FastGithubOps.UI $Version", '-F', "body=@$notesPath", '-F', 'draft=true', '--jq', '.id')
+    if ($draftId -notmatch '\A[1-9][0-9]*\z') {
+        throw "未获取到 $Version 的草稿 ID，请检查 $Repo 的 Releases"
+    }
+
+    $draftApi = "$repoApi/releases/$draftId"
+    try {
+        Write-Step "上传并核对草稿 $draftId 的资产"
+        foreach ($asset in $localAssets) {
+            $uploadUrl = "https://uploads.github.com/${draftApi}/assets?name=$($asset.Name)"
+            Invoke-GitHubApi @($uploadUrl, '--method', 'POST', '--input', $asset.Path,
+                '--header', 'Content-Type: application/octet-stream', '--silent')
+        }
+
+        $draft = Invoke-GitHubApi @($draftApi,
+            '--jq', '{draft,tag_name,target_commitish,assets:[.assets[] | {name,state,size,digest}]}') | ConvertFrom-Json
+        if ($draft.draft -ne $true -or $draft.tag_name -cne $Version -or $draft.target_commitish -ine $Target) {
+            throw '草稿状态、标签或目标提交与本次构建不符'
+        }
+        if ($draft.assets.Count -ne $localAssets.Count) {
+            throw "草稿资产数量不符，期望 $($localAssets.Count) 项，实际 $($draft.assets.Count) 项"
+        }
+        foreach ($local in $localAssets) {
+            $matching = @($draft.assets | Where-Object { $_.name -ceq $local.Name })
+            if ($matching.Count -ne 1) {
+                throw "草稿中找不到唯一的资产：$($local.Name)"
+            }
+            $remote = $matching[0]
+            if ($remote.state -cne 'uploaded' -or $remote.size -ne $local.Size -or $remote.digest -ine $local.Digest) {
+                throw "草稿资产的上传状态、大小或 SHA-256 校验失败：$($local.Name)"
+            }
+            Write-Host "核对一致：$($local.Name)（$($local.Size) 字节）"
+        }
+
+        Write-Step '创建标签并公开 Release'
+        # GitHub 会拒绝创建已存在的引用，避免并发发布时复用指向其他提交的同名标签。
+        Invoke-GitHubApi @("$repoApi/git/refs", '--method', 'POST', '-f', "ref=$tagRef",
+            '-f', "sha=$Target", '--silent')
+        $published = Invoke-GitHubApi @($draftApi, '--method', 'PATCH', '-F', 'draft=false',
+            '--jq', '{draft,tag_name,html_url}') | ConvertFrom-Json
+        if ($published.draft -ne $false -or $published.tag_name -cne $Version -or -not $published.html_url) {
+            throw 'GitHub 未确认 Release 已公开'
+        }
+        Write-Host "发布完成：$($published.html_url)" -ForegroundColor Green
+    } catch {
+        throw "发布中断，请检查 $Repo 的 Release $draftId 和标签 $Version。$($_.Exception.Message)"
+    }
+} finally {
     Pop-Location
 }
