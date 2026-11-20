@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Media;
 
 namespace FastGithub.UI
 {
@@ -18,6 +19,7 @@ namespace FastGithub.UI
         private readonly System.Windows.Forms.NotifyIcon notifyIcon;
         private readonly System.Windows.Forms.MenuItem pickIp;
         private readonly System.Windows.Forms.MenuItem restoreIp;
+        private readonly bool isAdministrator;
         private bool closed;
         private const string FASTGITHUB_UI = "FastGithub.UI";
         private const string RELEASES_URI = "https://github.com/yuan71058/FastGithub/releases";
@@ -25,6 +27,10 @@ namespace FastGithub.UI
         public MainWindow()
         {
             InitializeComponent();
+
+            // 启动弹窗/托盘气泡都是一次性的，这里把权限结果缓存下来，
+            // 供状态条、托盘文字、菜单项复用，避免重复查询 WindowsPrincipal。
+            this.isAdministrator = Program.IsAdministrator();
 
             var upgrade = new System.Windows.Forms.MenuItem("检测更新(&U)");
             upgrade.Click += (s, e) => Process.Start(RELEASES_URI);
@@ -72,6 +78,15 @@ namespace FastGithub.UI
             var openDir = new System.Windows.Forms.MenuItem("打开工具目录(&D)");
             openDir.Click += (s, e) => this.OpenToolDirectory();
 
+            // 提权重启入口：降级态可用；管理员态改文案并禁用，作为托盘菜单里的正向确认。
+            // 常驻状态条右上角也提供同一入口（见 ApplyAdminStatus）。
+            var restartAsAdmin = new System.Windows.Forms.MenuItem(
+                this.isAdministrator ? "已以管理员身份运行(&E)" : "以管理员身份重启(&E)")
+            {
+                Enabled = this.isAdministrator == false
+            };
+            restartAsAdmin.Click += (s, e) => this.RestartAsAdministratorAsync();
+
             var separator = new System.Windows.Forms.MenuItem("-");
 
             var version = this.GetType().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
@@ -81,9 +96,12 @@ namespace FastGithub.UI
                 Visible = true,
                 Text = FASTGITHUB_UI,
                 ContextMenu = new System.Windows.Forms.ContextMenu(new[]
-                    { refreshIp, this.pickIp, this.restoreIp, ipStatus, openConfig, openDir, separator, upgrade, settings, exit }),
+                    { refreshIp, this.pickIp, this.restoreIp, ipStatus, openConfig, openDir, separator, restartAsAdmin, upgrade, settings, exit }),
                 Icon = System.Drawing.Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath)
             };
+
+            // 常驻权限指示：主窗口状态条 + 托盘文字，随时可见。
+            this.ApplyAdminStatus();
 
             this.notifyIcon.MouseClick += (s, e) =>
             {
@@ -101,8 +119,8 @@ namespace FastGithub.UI
             }
 
             // 未以管理员身份运行时，托盘再提醒一次（此时用户已在启动弹窗选择「继续降级」）。
-            // 启动弹窗点掉后容易遗忘，托盘气泡作为持续可见的二次提醒。
-            if (Program.IsAdministrator() == false)
+            // 启动弹窗点掉后容易遗忘，托盘气泡作为二次提醒；状态条与托盘文字才是常驻指示。
+            if (this.isAdministrator == false)
             {
                 this.notifyIcon.ShowBalloonTip(
                     5000,
@@ -110,6 +128,125 @@ namespace FastGithub.UI
                     "未以管理员身份运行，透明拦截已降级为正向代理，加速效果受限。",
                     System.Windows.Forms.ToolTipIcon.Warning);
             }
+        }
+
+        /// <summary>
+        /// 按缓存的权限结果刷新常驻指示：状态条配色/文案/按钮 + 托盘文字。
+        /// <para>数据源为 <see cref="Program.IsAdministrator"/>（token 是否提升），
+        /// 不等价于后端 WinDivert 驱动一定加载成功；文案据此如实表述。</para>
+        /// </summary>
+        private void ApplyAdminStatus()
+        {
+            var modeText = this.isAdministrator ? "管理员模式" : "降级模式";
+            this.notifyIcon.Text = $"{FASTGITHUB_UI} · {modeText}";
+
+            if (this.isAdministrator)
+            {
+                this.AdminStatusBar.Background = ToBrush("#EAF3DE");
+                this.AdminStatusDot.Fill = ToBrush("#3B6D11");
+                this.AdminStatusText.Foreground = ToBrush("#173404");
+                this.AdminStatusText.Text = "管理员模式 · 透明拦截（DNS 劫持 + WinDivert 驱动）已启用";
+                this.AdminStatusAction.Foreground = ToBrush("#173404");
+                this.AdminStatusAction.Content = "状态说明";
+                this.AdminStatusAction.ToolTip = "查看当前运行模式说明";
+                this.AdminStatusBar.ToolTip = "已以管理员身份运行，具备加载 WinDivert 内核驱动的权限";
+            }
+            else
+            {
+                this.AdminStatusBar.Background = ToBrush("#FCEBEB");
+                this.AdminStatusDot.Fill = ToBrush("#A32D2D");
+                this.AdminStatusText.Foreground = ToBrush("#501313");
+                this.AdminStatusText.Text = "降级模式 · 正向代理 38457，透明拦截未启用，加速受限";
+                this.AdminStatusAction.Foreground = ToBrush("#501313");
+                this.AdminStatusAction.Content = "提权重启";
+                this.AdminStatusAction.ToolTip = "关闭当前实例并以管理员身份重新启动";
+                this.AdminStatusBar.ToolTip = "未以管理员身份运行，WinDivert 内核驱动无法加载，已降级为 127.0.0.1:38457 正向代理";
+            }
+        }
+
+        private static SolidColorBrush ToBrush(string rgb)
+        {
+            var color = ColorConverter.ConvertFromString(rgb) is Color c ? c : Colors.Transparent;
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            return brush;
+        }
+
+        /// <summary>
+        /// 状态条右上角按钮：管理员态查看说明，降级态发起提权重启。
+        /// </summary>
+        private void AdminStatusAction_Click(object sender, RoutedEventArgs e)
+        {
+            if (this.isAdministrator)
+            {
+                this.ShowAdminStatusDetail();
+            }
+            else
+            {
+                this.RestartAsAdministratorAsync();
+            }
+        }
+
+        /// <summary>
+        /// 管理员态的正向说明：告知如何自行确认透明拦截确实生效。
+        /// </summary>
+        private void ShowAdminStatusDetail()
+        {
+            System.Windows.MessageBox.Show(
+                "当前已以管理员身份运行，具备加载 WinDivert 内核驱动、启用透明拦截的权限。\n\n" +
+                "确认拦截是否真正生效：在 PowerShell 执行\n" +
+                "    Resolve-DnsName github.com -Type A\n" +
+                "返回 127.0.0.1 表示 DNS 透明拦截正在工作；若返回真实公网 IP，\n" +
+                "说明驱动未生效（多为杀软拦截），请检查白名单后重新以管理员身份运行。\n\n" +
+                "注意：本状态仅表示进程已提权，不承诺驱动一定加载成功。",
+                FASTGITHUB_UI,
+                System.Windows.MessageBoxButton.OK,
+                System.Windows.MessageBoxImage.Information);
+        }
+
+        /// <summary>
+        /// 降级态的一键提权重启：确认 → 以管理员身份拉起新实例 → 通知主程序停机 → 关闭自己。
+        /// <para>顺序不可颠倒：必须先确认新实例已拉起再停旧后端，否则 UAC 被取消时
+        /// 会出现"UI 还在、加速已停"的空窗。新实例带 --elevated-restart 等待互斥体释放，
+        /// 因此其 StartFastGithub 会推迟到旧实例退出后才执行，不会与旧后端抢端口。</para>
+        /// </summary>
+        private async void RestartAsAdministratorAsync()
+        {
+            var answer = System.Windows.MessageBox.Show(
+                "将以管理员身份重新启动 FastGithub，以启用透明拦截（DNS 劫持 + WinDivert 驱动）。\n\n" +
+                "重启期间 GitHub 加速会短暂中断，系统可能弹出 UAC 提示，请选择「是」。\n\n" +
+                "是否继续？",
+                FASTGITHUB_UI,
+                System.Windows.MessageBoxButton.OKCancel,
+                System.Windows.MessageBoxImage.Question,
+                System.Windows.MessageBoxResult.Cancel);
+
+            if (answer != System.Windows.MessageBoxResult.OK)
+            {
+                return;
+            }
+
+            // 顺序很关键：必须先确认新实例已成功拉起，才能通知旧后端停机。
+            // 否则一旦用户在 UAC 提示点"否"，Process.Start 失败返回，旧后端却已停，
+            // 会出现"UI 还在、加速已静默失效"的空窗。
+            if (Program.RestartAsAdministrator() == false)
+            {
+                this.notifyIcon.ShowBalloonTip(
+                    5000,
+                    FASTGITHUB_UI,
+                    "提权重启未能启动（可能已取消 UAC 提示），当前实例与加速保持原状。",
+                    System.Windows.Forms.ToolTipIcon.Warning);
+                return;
+            }
+
+            // 新实例带 --elevated-restart，此刻正阻塞在互斥体等待（见 Program.AcquireMutex），
+            // 尚未执行 StartFastGithub。等旧实例释放互斥体后才拉起新后端，正好避开
+            // 新旧实例同时占用 WinDivert 句柄与本地监听端口的冲突。
+            // 即便通知失败也继续：主程序有父进程轮询兜底（UI 退出后自行停机）。
+            await this.NotifyShutdownAsync();
+
+            this.Close();
+            Application.Current.Shutdown();
         }
 
         /// <summary>

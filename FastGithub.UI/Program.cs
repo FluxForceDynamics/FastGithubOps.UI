@@ -19,8 +19,11 @@ namespace FastGithub.UI
         static void Main(string[] args)
         {
             AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
-            using var mutex = new Mutex(true, MUTEX_NAME, out var isFirstInstance);
-            if (isFirstInstance == false)
+            // 提权重启拉起的新实例带 --elevated-restart：此时旧实例正在退出但尚未释放
+            // Global\FastGithub.UI 互斥体，按原逻辑直接 return 会让"提权重启"表现为点了没反应。
+            // 因此仅对该参数放行一次短暂等待，最长 20 秒后放弃，不影响普通启动的单实例判定。
+            using var mutex = AcquireMutex(waitForPrevious: Array.IndexOf(args, "--elevated-restart") >= 0);
+            if (mutex == null)
             {
                 return;
             }
@@ -110,6 +113,71 @@ namespace FastGithub.UI
             using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
             var principal = new System.Security.Principal.WindowsPrincipal(identity);
             return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+
+        /// <summary>
+        /// 获取 UI 单实例互斥体。
+        /// <para>普通启动遇到已有实例立即返回 null；提权重启（waitForPrevious=true）时，
+        /// 旧实例正在退出，需要短暂等待其释放互斥体，否则新实例会被误判为"重复启动"而退出。</para>
+        /// </summary>
+        private static Mutex? AcquireMutex(bool waitForPrevious)
+        {
+            var deadline = DateTime.Now.AddSeconds(20d);
+            while (true)
+            {
+                var mutex = new Mutex(true, MUTEX_NAME, out var isFirstInstance);
+                if (isFirstInstance)
+                {
+                    return mutex;
+                }
+
+                mutex.Dispose();
+                if (waitForPrevious == false || DateTime.Now >= deadline)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(300);
+            }
+        }
+
+        /// <summary>
+        /// 以管理员身份重新启动 UI，返回是否已成功拉起提权进程。
+        /// <para>调用方须在返回 true 后才通知主程序停机、关闭自己：用户在 UAC 提示点"否"
+        /// 时返回 false，当前实例与后端都应保持原状，避免出现"旧实例已退、新实例没起来"的空窗。</para>
+        /// </summary>
+        public static bool RestartAsAdministrator()
+        {
+            try
+            {
+                // MainModule 在受限会话可能抛异常，整个路径获取一并纳入 try。
+                var exePath = Process.GetCurrentProcess().MainModule?.FileName;
+                if (string.IsNullOrEmpty(exePath))
+                {
+                    exePath = Assembly.GetEntryAssembly()?.Location;
+                }
+                if (string.IsNullOrEmpty(exePath) || File.Exists(exePath) == false)
+                {
+                    return false;
+                }
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = "--elevated-restart",
+                    // UAC 提权后工作目录可能落到 system32，显式指回程序目录，
+                    // 保证 fastgithub.exe / appsettings 等同目录资源可被定位。
+                    WorkingDirectory = Path.GetDirectoryName(exePath) ?? string.Empty,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+                return true;
+            }
+            catch (Exception)
+            {
+                // UAC 取消、提权被策略拒绝或进程启动失败：维持当前实例不变，交由调用方提示。
+                return false;
+            }
         }
 
         /// <summary>

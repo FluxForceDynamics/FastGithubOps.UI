@@ -143,7 +143,25 @@
         </ResourceDictionary>
     </Window.Resources>
     <Grid Background="#00ffffff">
-        <TabControl Style="{StaticResource TabControlWithUnderLineStyle}" Foreground="Black" Background="Transparent" BorderBrush="Transparent" BorderThickness="0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 常驻权限状态条：启动弹窗/托盘气泡都是一次性的，用户点掉后无从判断当前运行模式。
+             这里把"是否已提权 + 拦截模式"做成随时可见的指示：管理员态正向确认、降级态警告并给出提权重启。
+             配色与文案由 MainWindow.xaml.cs 的 ApplyAdminStatus 按 IsAdministrator() 统一设置。 -->
+        <Border x:Name="AdminStatusBar" Grid.Row="0" Padding="12,6" BorderThickness="0,0,0,1" BorderBrush="#FFACACAC">
+            <DockPanel LastChildFill="True">
+                <Ellipse x:Name="AdminStatusDot" DockPanel.Dock="Left" Width="9" Height="9" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                <Button x:Name="AdminStatusAction" DockPanel.Dock="Right" Margin="8,0,0,0" Padding="8,2"
+                        Background="Transparent" BorderThickness="0" Cursor="Hand" FontSize="12"
+                        VerticalAlignment="Center" Click="AdminStatusAction_Click"/>
+                <TextBlock x:Name="AdminStatusText" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </DockPanel>
+        </Border>
+
+        <TabControl Grid.Row="1" Style="{StaticResource TabControlWithUnderLineStyle}" Foreground="Black" Background="Transparent" BorderBrush="Transparent" BorderThickness="0">
             <TabItem Style="{StaticResource TabItemExWithUnderLineStyle}" Header="流量" Height="40" Width="60"  Margin="5 0" FontSize="18">
                 <Grid Background="#f7f7f7">
                     <local:FlowChart Margin="16" />
